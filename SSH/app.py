@@ -5,6 +5,7 @@ import posixpath
 import os
 import stat
 from datetime import datetime
+import time
 
 class SSHFileManager:
     def __init__(self, root):
@@ -15,8 +16,11 @@ class SSHFileManager:
 
         self.ssh = None
         self.sftp = None
-        self.home_path = "/home/sanskar/shared_ssh_folder"
+        self.home_path = None
         self.current_path = self.home_path
+        self.transfer_active = False
+        self.last_update_time = 0
+        self.last_bytes_transferred = 0
 
         self.init_login_frame()
 
@@ -50,11 +54,17 @@ class SSHFileManager:
             self.ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
             self.ssh.connect(hostname=host, username=user, password=passwd)
             self.sftp = self.ssh.open_sftp()
+
+            # 🧠 Dynamically set home path based on user
+            self.home_path = f"/home/{user}/shared_ssh_folder"
+            self.current_path = self.home_path
+
+            # Create the folder if it doesn't exist
             try:
                 self.sftp.stat(self.home_path)
             except IOError:
                 self.sftp.mkdir(self.home_path)
-            self.current_path = self.home_path
+
             self.show_file_browser()
         except Exception as e:
             messagebox.showerror("Login Failed", str(e))
@@ -104,7 +114,34 @@ class SSHFileManager:
         for i, (text, command) in enumerate(buttons):
             tk.Button(btn_frame, text=text, width=14, font=("Consolas", 10), command=command).grid(row=0, column=i, padx=5)
 
+        # Status bar for transfer information
+        self.status_bar = tk.Label(self.browser_frame, text="Ready", bg="#121212", fg="#00FFAA", 
+                                 font=("Consolas", 10), anchor='w', relief=tk.SUNKEN, padx=10)
+        self.status_bar.pack(fill='x', side=tk.BOTTOM, pady=(0, 10))
+
         self.refresh_file_list()
+
+    def update_status(self, message):
+        self.status_bar.config(text=message)
+        self.root.update_idletasks()
+
+    def progress_callback(self, transferred, total):
+        now = time.time()
+        if now - self.last_update_time >= 0.5:  # Update every 0.5 seconds
+            speed = (transferred - self.last_bytes_transferred) / (now - self.last_update_time)
+            speed_kb = speed / 1024
+            speed_mb = speed_kb / 1024
+            
+            if speed_mb >= 1:
+                speed_str = f"{speed_mb:.2f} MB/s"
+            else:
+                speed_str = f"{speed_kb:.2f} KB/s"
+            
+            percent = (transferred / total) * 100
+            self.update_status(f"Transferring: {percent:.1f}% - Speed: {speed_str} - {transferred//1024} KB / {total//1024} KB")
+            
+            self.last_update_time = now
+            self.last_bytes_transferred = transferred
 
     def refresh_file_list(self):
         try:
@@ -149,23 +186,43 @@ class SSHFileManager:
     def upload_files(self):
         local_paths = filedialog.askopenfilenames()
         if local_paths:
-            for local_path in local_paths:
+            total_files = len(local_paths)
+            success_count = 0
+            
+            for i, local_path in enumerate(local_paths):
                 try:
                     remote_path = posixpath.join(self.current_path, os.path.basename(local_path))
-                    self.sftp.put(local_path, remote_path)
+                    file_size = os.path.getsize(local_path)
+                    
+                    self.update_status(f"Preparing to upload {os.path.basename(local_path)} ({i+1}/{total_files})...")
+                    self.last_update_time = time.time()
+                    self.last_bytes_transferred = 0
+                    
+                    # Custom callback for upload progress
+                    def callback(uploaded, total):
+                        self.progress_callback(uploaded, total)
+                    
+                    self.sftp.put(local_path, remote_path, callback=callback)
+                    success_count += 1
+                    self.update_status(f"Uploaded {os.path.basename(local_path)} successfully")
                 except Exception as e:
+                    self.update_status(f"Error uploading {os.path.basename(local_path)}")
                     messagebox.showerror("Upload Failed", f"{os.path.basename(local_path)}: {str(e)}")
+            
             self.refresh_file_list()
-            messagebox.showinfo("Upload Complete", f"{len(local_paths)} file(s) uploaded.")
+            self.update_status(f"Upload complete: {success_count}/{total_files} files uploaded successfully")
 
     def upload_folder(self):
         folder_path = filedialog.askdirectory()
         if folder_path:
             try:
+                self.update_status(f"Starting folder upload: {os.path.basename(folder_path)}...")
                 self.upload_directory_recursive(folder_path, self.current_path)
                 self.refresh_file_list()
+                self.update_status(f"Folder '{os.path.basename(folder_path)}' uploaded successfully")
                 messagebox.showinfo("Success", f"Folder '{os.path.basename(folder_path)}' uploaded.")
             except Exception as e:
+                self.update_status("Folder upload failed")
                 messagebox.showerror("Upload Failed", str(e))
 
     def upload_directory_recursive(self, local_dir, remote_dir):
@@ -176,13 +233,26 @@ class SSHFileManager:
         except IOError:
             pass  # If folder already exists
 
-        for item in os.listdir(local_dir):
+        items = os.listdir(local_dir)
+        total_items = len(items)
+        
+        for i, item in enumerate(items):
             local_path = os.path.join(local_dir, item)
             remote_path = posixpath.join(new_remote_path, item)
+            
+            self.update_status(f"Uploading {item} ({i+1}/{total_items}) in {folder_name}...")
+            
             if os.path.isdir(local_path):
                 self.upload_directory_recursive(local_path, new_remote_path)
             else:
-                self.sftp.put(local_path, remote_path)
+                file_size = os.path.getsize(local_path)
+                self.last_update_time = time.time()
+                self.last_bytes_transferred = 0
+                
+                def callback(uploaded, total):
+                    self.progress_callback(uploaded, total)
+                
+                self.sftp.put(local_path, remote_path, callback=callback)
 
     def download_file(self):
         selection = self.tree.item(self.tree.focus())
@@ -192,11 +262,22 @@ class SSHFileManager:
         name = values[0]
         remote_path = posixpath.join(self.current_path, name)
         local_path = filedialog.asksaveasfilename(initialfile=name)
+        
         if local_path:
             try:
-                self.sftp.get(remote_path, local_path)
+                file_size = self.sftp.stat(remote_path).st_size
+                self.update_status(f"Starting download of {name}...")
+                self.last_update_time = time.time()
+                self.last_bytes_transferred = 0
+                
+                def callback(downloaded, total):
+                    self.progress_callback(downloaded, total)
+                
+                self.sftp.get(remote_path, local_path, callback=callback)
+                self.update_status(f"Downloaded {name} successfully")
                 messagebox.showinfo("Success", f"Downloaded to {local_path}")
             except Exception as e:
+                self.update_status(f"Download failed: {str(e)}")
                 messagebox.showerror("Download Failed", str(e))
 
     def delete_file(self):
@@ -215,8 +296,10 @@ class SSHFileManager:
             else:
                 self.sftp.remove(remote_path)
             self.refresh_file_list()
+            self.update_status(f"Deleted {name}")
             messagebox.showinfo("Deleted", f"Deleted {name}")
         except Exception as e:
+            self.update_status(f"Delete failed: {str(e)}")
             messagebox.showerror("Delete Failed", str(e))
 
     def create_folder(self):
@@ -226,13 +309,16 @@ class SSHFileManager:
             try:
                 self.sftp.mkdir(new_dir)
                 self.refresh_file_list()
+                self.update_status(f"Created folder: {folder_name}")
                 messagebox.showinfo("Folder Created", f"Created folder: {folder_name}")
             except Exception as e:
+                self.update_status(f"Folder creation failed: {str(e)}")
                 messagebox.showerror("Creation Failed", str(e))
 
     def go_home(self):
         self.current_path = self.home_path
         self.refresh_file_list()
+        self.update_status("Navigated to home directory")
 
 if __name__ == '__main__':
     root = tk.Tk()
