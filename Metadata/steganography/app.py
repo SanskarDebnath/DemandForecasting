@@ -506,7 +506,7 @@ class AdvancedMetadataAnalyzer:
             messagebox.showwarning("Warning", "No image selected", parent=self.root)
             return
             
-        MAX_SIZE = 96000  # Safe limit for metadata comments
+        MAX_SIZE = 9600  # Safe limit for metadata comments
         
         file_path = filedialog.askopenfilename(title="Select file to hide")
         if not file_path:
